@@ -129,6 +129,9 @@ type DeviceMemory struct {
 	// with system management libraries
 	UUID string
 
+	TotalMemory uint64
+	FreeMemory  uint64
+
 	// Weights is the per-layer memory needed for the model weights.
 	Weights []Memory
 
