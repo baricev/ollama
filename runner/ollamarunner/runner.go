@@ -11,9 +11,11 @@ import (
 	"image"
 	"log"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -836,8 +838,19 @@ func (s *Server) initModel(
 	kvCacheType string,
 	kvSize int,
 	multiUserCache bool,
-) error {
+) (panicErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if err, ok := r.(error); ok {
+				panicErr = err
+			} else {
+				panic(r)
+			}
+		}
+	}()
+
 	var err error
+	slog.Info("initModel", "params", params)
 	s.model, err = model.New(mpath, params)
 	if err != nil {
 		return err
@@ -865,33 +878,171 @@ func (s *Server) initModel(
 	return s.reserveWorstCaseGraph()
 }
 
+func fit(layers []uint64, gpuFreeSpace []uint64, capacity float32) (numGPU int, gpuLayers []float32) {
+	gpuLayers = make([]float32, len(gpuFreeSpace))
+	device := len(gpuFreeSpace) - 1
+	freeSpace := float32(gpuFreeSpace[device]) * capacity
+	for i := len(layers) - 1; i >= 0; i-- {
+		for {
+			if float32(layers[i]) <= freeSpace {
+				gpuLayers[device]++
+				freeSpace -= float32(layers[i])
+				break
+			}
+
+			device--
+			if device < 0 {
+				goto out
+			}
+			freeSpace = float32(gpuFreeSpace[device]) * capacity
+		}
+	}
+
+out:
+	for _, l := range gpuLayers {
+		numGPU += int(l)
+	}
+
+	return numGPU, gpuLayers
+}
+
+func distributeGPU(layers []uint64, gpuFreeSpace []uint64) (numGPU int, gpuLayers []float32) {
+	var high float32 = 1
+	var low float32 = 0
+
+	maxNumGPU, bestAssignemnts := fit(layers, gpuFreeSpace, high)
+	if maxNumGPU == 0 {
+		return maxNumGPU, bestAssignemnts
+	}
+
+	for high-low > 1e-6 {
+		mid := (low + high) / 2
+		numGPU, assignemnts := fit(layers, gpuFreeSpace, mid)
+		if numGPU == maxNumGPU {
+			high = mid
+			bestAssignemnts = assignemnts
+		} else {
+			low = mid
+		}
+	}
+
+	return maxNumGPU, bestAssignemnts
+}
+
+func fitGPU(memory *ml.BackendMemory, numThreads int, flashAttention bool) ml.BackendParams {
+	// TODO: We need to ensure that we have a stable output and not cycling between a few states without converging
+
+	fullOffload := ml.BackendParams{
+		NumThreads:     numThreads,
+		NumGPULayers:   math.MaxInt,
+		TensorSplit:    []float32{1},
+		FlashAttention: flashAttention,
+	}
+
+	if memory == nil || len(memory.CPU.Weights) == 0 {
+		return fullOffload
+	}
+
+	layers := make([]uint64, len(memory.CPU.Weights))
+	var maxGpuGraph uint64
+	for i := range layers {
+		for j := range memory.GPUs {
+			layers[i] += memory.GPUs[j].Weights[i].Size
+			layers[i] += memory.GPUs[j].Cache[i].Size
+			maxGpuGraph = max(maxGpuGraph, memory.GPUs[j].Graph.Size)
+		}
+		layers[i] += memory.CPU.Weights[i].Size
+		layers[i] += memory.CPU.Cache[i].Size
+	}
+
+	// TODO: Sort GPUs by free memory
+	gpuFreeSpace := make([]uint64, len(memory.GPUs))
+	for i := range gpuFreeSpace {
+		gpuGraph := memory.GPUs[i].Graph.Size
+		if gpuGraph == 0 {
+			gpuGraph = maxGpuGraph
+		}
+
+		gpuFreeSpace[i] = memory.GPUs[i].FreeMemory - uint64(float32(memory.GPUs[i].TotalMemory)*0.05) - gpuGraph
+	}
+
+	var numGPU int
+	var gpuLayers []float32
+	for i := range gpuFreeSpace {
+		// Try to pack things into as few GPUs as possible
+		numGPU, gpuLayers = distributeGPU(layers, gpuFreeSpace[:i+1])
+		if numGPU == len(layers) {
+			break
+		}
+	}
+	if numGPU < len(layers) {
+		// If we can't fit everything then prefer offloading layers other than the output layer
+		numGPU, gpuLayers = distributeGPU(layers[:len(layers)-1], gpuFreeSpace)
+	}
+
+	if len(layers) == int(gpuLayers[0]) {
+		return fullOffload
+	}
+
+	return ml.BackendParams{
+		NumThreads:     numThreads,
+		NumGPULayers:   numGPU,
+		TensorSplit:    gpuLayers,
+		FlashAttention: flashAttention,
+	}
+}
+
 func (s *Server) load(
 	ctx context.Context,
 	mpath string,
-	params ml.BackendParams,
 	lpath multiLPath,
+	threads int,
 	parallel int,
+	flashAttention bool,
 	kvCacheType string,
 	kvSize int,
 	multiUserCache bool,
 ) {
-	err := s.initModel(mpath, params, lpath, parallel, kvCacheType, kvSize, multiUserCache)
-	if err != nil {
-		var noMem ml.ErrNoMem
-		if errors.As(err, &noMem) {
-			// We can't yet handle this but in the future we will
-			s.cache.Close()
-			if s.model != nil {
-				s.model.Backend().Close()
+	params := fitGPU(nil, threads, flashAttention)
+
+	// TODO: we should give up after a while
+	for {
+		err := s.initModel(mpath, params, lpath, parallel, kvCacheType, kvSize, multiUserCache)
+		var memory ml.BackendMemory
+		if err != nil {
+			var noMem ml.ErrNoMem
+			if !errors.As(err, &noMem) {
+				panic(err)
 			}
+
+			memory = noMem.BackendMemory
+		} else {
+			memory = s.model.Backend().BackendMemory()
 		}
 
-		panic(err)
+		slog.Info("memory", "required", memory)
+
+		newParams := fitGPU(&memory, threads, flashAttention)
+
+		if reflect.DeepEqual(params, newParams) {
+			// TODO: We should react to this somehow since the free VRAM may not be 100% accurate (either it changed
+			// or between query and allocation or the driver reports the wrong value)
+			if err != nil {
+				panic(fmt.Errorf("memory layout cannot be allocated (requested %v result %v)", params, memory))
+			}
+
+			break
+		}
+
+		params = newParams
+
+		s.cache.Close()
+		if s.model != nil {
+			s.model.Backend().Close()
+		}
 	}
 
-	slog.Debug("memory", "allocated", s.model.Backend().BackendMemory())
-
-	err = s.model.Backend().Load(ctx,
+	err := s.model.Backend().Load(ctx,
 		func(progress float32) {
 			s.progress = progress
 		})
@@ -908,8 +1059,8 @@ func Execute(args []string) error {
 	mpath := fs.String("model", "", "Path to model binary file")
 	parallel := fs.Int("parallel", 1, "Number of sequences to handle simultaneously")
 	batchSize := fs.Int("batch-size", 512, "Batch size")
-	numGPULayers := fs.Int("n-gpu-layers", 0, "Number of layers to offload to GPU")
-	mainGPU := fs.Int("main-gpu", 0, "Main GPU")
+	_ = fs.Int("n-gpu-layers", 0, "Number of layers to offload to GPU")
+	_ = fs.Int("main-gpu", 0, "Main GPU")
 	flashAttention := fs.Bool("flash-attn", false, "Enable flash attention")
 	kvSize := fs.Int("ctx-size", 2048, "Context (or KV cache) size")
 	kvCacheType := fs.String("kv-cache-type", "", "quantization type for KV cache (default: f16)")
@@ -917,7 +1068,8 @@ func Execute(args []string) error {
 	threads := fs.Int("threads", runtime.NumCPU(), "Number of threads to use during generation")
 	_ = fs.Bool("verbose", false, "verbose output (default: disabled)")
 	_ = fs.Bool("no-mmap", false, "do not memory-map model (slower load but may reduce pageouts if not using mlock)")
-	tensorSplit := fs.String("tensor-split", "", "fraction of the model to offload to each GPU, comma-separated list of proportions")
+	_ = fs.String("tensor-split", "", "fraction of the model to offload to each GPU, comma-separated list of proportions")
+
 	multiUserCache := fs.Bool("multiuser-cache", false, "optimize input cache algorithm for multiple users")
 
 	var lpaths multiLPath
@@ -947,25 +1099,7 @@ func Execute(args []string) error {
 	// TODO(jessegross): Parameters that need to be implemented:
 	//	no-mmap
 
-	var tensorSplitFloats []float32
-	if *tensorSplit != "" {
-		splits := strings.Split(*tensorSplit, ",")
-		tensorSplitFloats = make([]float32, len(splits))
-		for i, s := range splits {
-			f, _ := strconv.ParseFloat(s, 32)
-			tensorSplitFloats[i] = float32(f)
-		}
-	}
-
-	params := ml.BackendParams{
-		NumThreads:     *threads,
-		NumGPULayers:   *numGPULayers,
-		MainGPU:        *mainGPU,
-		TensorSplit:    tensorSplitFloats,
-		FlashAttention: *flashAttention,
-	}
-
-	go server.load(ctx, *mpath, params, lpaths, *parallel, *kvCacheType, *kvSize, *multiUserCache)
+	go server.load(ctx, *mpath, lpaths, *threads, *parallel, *flashAttention, *kvCacheType, *kvSize, *multiUserCache)
 	go server.run(ctx)
 
 	addr := "127.0.0.1:" + strconv.Itoa(*port)

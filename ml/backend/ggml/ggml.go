@@ -186,7 +186,7 @@ func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
 			splits[i] = float32(free)
 		}
 	} else {
-		splits = params.TensorSplit
+		copy(splits, params.TensorSplit)
 	}
 
 	var sum float32
